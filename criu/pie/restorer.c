@@ -299,6 +299,55 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 
 skip_xids:
 	/*
+	 * Recreate ambient capabilities before installing securebits, which may
+	 * irreversibly forbid PR_CAP_AMBIENT_RAISE. Keep the current permitted
+	 * and effective sets until the securebits/bounding-set operations below
+	 * are complete. Only add the inheritable bits required for ambient.
+	 */
+	for (b = 0; b < CR_CAP_SIZE; b++) {
+		if (args->cap_amb[b])
+			break;
+	}
+	/* Do not retain ambient bits inherited by the CRIU launcher. Old kernels
+	 * without the ambient API can only restore an empty ambient set.
+	 */
+	ret = sys_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+	if (ret && (ret != -EINVAL || b != CR_CAP_SIZE)) {
+		pr_err("Unable to clear inherited ambient capabilities: %d\n", ret);
+		return -1;
+	}
+	if (b != CR_CAP_SIZE) {
+		hdr.version = _LINUX_CAPABILITY_VERSION_3;
+		hdr.pid = 0;
+		ret = sys_capget(&hdr, data);
+		if (ret) {
+			pr_err("Unable to read temporary capabilities: %d\n", ret);
+			return -1;
+		}
+		for (b = 0; b < CR_CAP_SIZE; b++)
+			data[b].inh |= args->cap_amb[b];
+		ret = sys_capset(&hdr, data);
+		if (ret) {
+			pr_err("Unable to prepare ambient capabilities: %d\n", ret);
+			return -1;
+		}
+		for (b = 0; b < CR_CAP_SIZE; b++) {
+			for (i = 0; i < 32; i++) {
+				if (b * 32 + i > args->cap_last_cap)
+					break;
+				if ((args->cap_amb[b] & (1 << i)) == 0)
+					/* don't set */
+					continue;
+				ret = sys_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i + b * 32, 0, 0);
+				if (!ret)
+					continue;
+				pr_err("Unable to raise ambient capability %d: %d\n", i + b * 32, ret);
+				return -1;
+			}
+		}
+	}
+
+	/*
 	 * Third -- restore securebits. We don't need them in any
 	 * special state any longer.
 	 */
@@ -360,22 +409,6 @@ skip_xids:
 		pr_err("Unable to restore capabilities: %d\n", ret);
 		return -1;
 	}
-
-	for (b = 0; b < CR_CAP_SIZE; b++) {
-		for (i = 0; i < 32; i++) {
-			if (b * 32 + i > args->cap_last_cap)
-				break;
-			if ((args->cap_amb[b] & (1 << i)) == 0)
-				/* don't set */
-				continue;
-			ret = sys_prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i + b * 32, 0, 0);
-			if (!ret)
-				continue;
-			pr_err("Unable to raise ambient capability %d: %d\n", i + b * 32, ret);
-			return -1;
-		}
-	}
-
 
 	if (lsm_type != LSMTYPE__SELINUX) {
 		/*
