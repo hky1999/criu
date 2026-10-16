@@ -1251,14 +1251,14 @@ static int timerfd_arm(struct task_restore_args *args)
 
 		pr_debug("timerfd: arm for fd %d (%d)\n", t->fd, i);
 
-		if (t->settime_flags & TFD_TIMER_ABSTIME) {
+		if ((t->settime_flags & TFD_TIMER_ABSTIME) &&
+		    (t->val.it_value.tv_sec || t->val.it_value.tv_nsec)) {
 			struct timespec ts;
 
 			/*
-			 * We might need to adjust value because the checkpoint
-			 * and restore procedure takes some time itself. Note
-			 * we don't adjust nanoseconds, since the result may
-			 * overflow the limit NSEC_PER_SEC FIXME
+			 * Images store the remaining duration. Convert it to an
+			 * absolute deadline using the full current clock value;
+			 * a zero duration must remain disarmed.
 			 */
 			if (sys_clock_gettime(t->clockid, &ts)) {
 				pr_err("Can't get current time\n");
@@ -1266,6 +1266,11 @@ static int timerfd_arm(struct task_restore_args *args)
 			}
 
 			t->val.it_value.tv_sec += (time_t)ts.tv_sec;
+			t->val.it_value.tv_nsec += ts.tv_nsec;
+			if (t->val.it_value.tv_nsec >= NSEC_PER_SEC) {
+				t->val.it_value.tv_sec++;
+				t->val.it_value.tv_nsec -= NSEC_PER_SEC;
+			}
 
 			pr_debug("Adjust id %x it_value(%llu, %llu) -> it_value(%llu, %llu)\n", t->id,
 				 (unsigned long long)ts.tv_sec, (unsigned long long)ts.tv_nsec,
