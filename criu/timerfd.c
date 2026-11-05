@@ -68,9 +68,47 @@ static int dump_one_timerfd(int lfd, u32 id, const struct fd_parms *p)
 {
 	TimerfdEntry tfe = TIMERFD_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
+	struct itimerspec current;
+	int attempt;
+	bool active = false;
+	u64 ticks;
 
 	if (parse_fdinfo(lfd, FD_TYPES__TIMERFD, &tfe))
 		return -1;
+	active = tfe.vsec || tfe.vnsec;
+
+	/*
+	 * An expired periodic timer is rearmed lazily by read/gettime. fdinfo
+	 * alone exposes zero remaining time and one pending tick, which is
+	 * indistinguishable from a disarmed timer with injected ticks. Restoring
+	 * that snapshot would permanently disarm the periodic timer.
+	 *
+	 * gettime accounts for overruns and rearms without consuming ticks.
+	 * Read fdinfo afterwards so both the remaining delay and pending count
+	 * describe the normalized state. A very short period can expire again
+	 * before fdinfo: retry, then fail explicitly instead of losing rearm.
+	 * Even gettime can return zero for a period shorter than the syscall.
+	 * In that case the pending tick count advances on normalization. Only
+	 * accept an all-zero remaining time when all samples have stable ticks
+	 * and neither interface ever reports an active timer. This preserves a
+	 * disarmed periodic timer with manually injected ticks.
+	 */
+	for (attempt = 0; attempt < 32; attempt++) {
+		ticks = tfe.ticks;
+		if (timerfd_gettime(lfd, &current)) {
+			pr_perror("Can't normalize timerfd %#x", id);
+			return -1;
+		}
+		if (parse_fdinfo(lfd, FD_TYPES__TIMERFD, &tfe))
+			return -1;
+		active |= current.it_value.tv_sec || current.it_value.tv_nsec || ticks != tfe.ticks;
+		if ((!tfe.isec && !tfe.insec) || tfe.vsec || tfe.vnsec)
+			break;
+	}
+	if (attempt == 32 && active) {
+		pr_err("Timerfd %#x repeatedly expired while collecting fdinfo\n", id);
+		return -1;
+	}
 
 	tfe.id = id;
 	tfe.flags = p->flags;
