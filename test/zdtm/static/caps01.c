@@ -3,10 +3,17 @@
 #include <sys/types.h>
 #include <sys/prctl.h>
 #include <linux/capability.h>
+#ifdef LOCK_AMBIENT_SECUREBITS
+#include <linux/securebits.h>
+#endif
 
 #include "zdtmtst.h"
 
+#ifdef LOCK_AMBIENT_SECUREBITS
+const char *test_doc = "Preserve ambient capabilities with locked NO_CAP_AMBIENT_RAISE";
+#else
 const char *test_doc = "Check that CapAmb are preserved";
+#endif
 const char *test_author = "Liu Chao <liuchao173@huawei.com>";
 
 struct cap_hdr {
@@ -64,6 +71,9 @@ int main(int argc, char **argv)
 	pid = test_fork();
 	if (pid == 0) {
 		int b, i, ret;
+#ifdef LOCK_AMBIENT_SECUREBITS
+		int securebits;
+#endif
 		struct cap_hdr hdr;
 		struct cap_data data[_LINUX_CAPABILITY_U32S_3];
 
@@ -104,8 +114,39 @@ int main(int argc, char **argv)
 			}
 		}
 
+#ifdef LOCK_AMBIENT_SECUREBITS
+		securebits = prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
+		if (securebits < 0) {
+			pr_perror("Unable to read securebits");
+			return -1;
+		}
+		securebits |= SECBIT_NO_CAP_AMBIENT_RAISE | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+		if (prctl(PR_SET_SECUREBITS, securebits, 0, 0, 0)) {
+			pr_perror("Unable to lock ambient raises");
+			return -1;
+		}
+#endif
+
 		task_waiter_complete_current(&t);
 		task_waiter_wait4(&t, getppid());
+
+#ifdef LOCK_AMBIENT_SECUREBITS
+		if (prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) != securebits) {
+			fail("Securebits changed after restore");
+			goto bad;
+		}
+		errno = 0;
+		if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_CHOWN, 0, 0) != -1 || errno != EPERM) {
+			fail("Ambient raises are not forbidden after restore");
+			goto bad;
+		}
+		errno = 0;
+		if (prctl(PR_SET_SECUREBITS, securebits & ~SECBIT_NO_CAP_AMBIENT_RAISE, 0, 0, 0) != -1 ||
+		    errno != EPERM) {
+			fail("Ambient securebit lock was not preserved");
+			goto bad;
+		}
+#endif
 
 		for (b = 0; b < _LINUX_CAPABILITY_U32S_3; b++) {
 			amb_2[b] = 0;
